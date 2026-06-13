@@ -1,0 +1,23 @@
+[project]
+name = "auto-yt"
+version = "0.1.0"
+description = "Recognize currently playing music and open the top YouTube result."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Rekka \"horizon\" IGUMI" },
+]
+dependencies = [
+    "numpy>=1.26",
+    "shazamio>=0.7.0",
+    "sounddevice>=0.4.6",
+    "yt-dlp>=2024.1.1",
+]
+
+[project.scripts]
+auto-yt = "auto_yt.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

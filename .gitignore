@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv/local tooling
+.python-version
+
+# Generated audio/debug samples
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
