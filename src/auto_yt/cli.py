@@ -15,14 +15,18 @@ from auto_yt.audio import record_wav
 from auto_yt.audio import resolve_input_device_name
 from auto_yt.player import YoutubePlayerServer
 from auto_yt.recognizer import RecognizedSong
+from auto_yt.recognizer import get_system_language
+from auto_yt.recognizer import normalize_language
 from auto_yt.recognizer import recognize_music
 from auto_yt.youtube import YoutubeVideo
-from auto_yt.youtube import find_top_youtube_video
+from auto_yt.youtube import YoutubeSearch
+from auto_yt.youtube import find_youtube_search
 
 
-DEFAULT_SECONDS = 10.0
+DEFAULT_SECONDS = 6.0
 DEFAULT_SAMPLE_RATE = None
-DEFAULT_INTERVAL = 5.0
+DEFAULT_INTERVAL = 0.0
+DEFAULT_CONFIRMATIONS = 1
 
 
 def main() -> None:
@@ -84,6 +88,17 @@ def parse_args() -> argparse.Namespace:
         help="input channel count, or 'auto' to inspect all channels (default: auto)",
     )
     parser.add_argument(
+        "--language",
+        default=None,
+        help="recognition language such as ja-JP or en-US (default: system language)",
+    )
+    parser.add_argument(
+        "--confirmations",
+        type=int,
+        default=DEFAULT_CONFIRMATIONS,
+        help=f"consecutive matching recognitions required before switching videos (default: {DEFAULT_CONFIRMATIONS})",
+    )
+    parser.add_argument(
         "--list-devices",
         "--device-list",
         action="store_true",
@@ -118,11 +133,15 @@ async def run(args: argparse.Namespace) -> None:
         raise RuntimeError("--seconds must be greater than 0")
     if args.interval < 0:
         raise RuntimeError("--interval must be 0 or greater")
+    if args.confirmations <= 0:
+        raise RuntimeError("--confirmations must be greater than 0")
     if args.device is not None and args.device_name is not None:
         raise RuntimeError("--device and --device-name cannot be used together")
     if args.device_name is not None:
         args.device = resolve_input_device_name(args.device_name)
     args.channels = parse_channels(args.channels)
+    args.language = normalize_language(args.language or get_system_language())
+    print(f"Recognition language: {args.language}")
     player = None if args.no_open else YoutubePlayerServer()
 
     with tempfile.TemporaryDirectory(prefix="auto-yt-") as tmp_dir:
@@ -144,7 +163,10 @@ async def watch_for_song_changes(
     player: YoutubePlayerServer | None,
 ) -> None:
     last_song_key: str | None = None
-    videos_by_song: dict[str, YoutubeVideo] = {}
+    pending_song_key: str | None = None
+    pending_song: RecognizedSong | None = None
+    pending_count = 0
+    searches_by_song: dict[str, YoutubeSearch] = {}
     print("Watching for music changes. Press Ctrl+C to stop.")
 
     while True:
@@ -155,20 +177,33 @@ async def watch_for_song_changes(
             print(f"Not recognized: {exc}", file=sys.stderr)
         else:
             song_key = song.key
-            if song_key != last_song_key:
-                print(f"Detected change: {song.search_query}")
-                video = videos_by_song.get(song_key)
-                if video is None:
-                    video = open_youtube_for_song(song, player=player)
-                    videos_by_song[song_key] = video
-                else:
-                    print(f"Top result: {video.title}")
-                    print(video.url)
-                    if player is not None:
-                        player.show(video)
-                last_song_key = song_key
-            else:
+            if song_key == last_song_key:
+                pending_song_key = None
+                pending_song = None
+                pending_count = 0
                 print(f"No change: {song.search_query}")
+            else:
+                if pending_song_key == song_key:
+                    pending_count += 1
+                else:
+                    pending_song_key = song_key
+                    pending_song = song
+                    pending_count = 1
+
+                print(
+                    f"Candidate change: {song.search_query} "
+                    f"({pending_count}/{args.confirmations})"
+                )
+                if pending_count >= args.confirmations and pending_song is not None:
+                    video = switch_to_song(
+                        pending_song,
+                        searches_by_song=searches_by_song,
+                        player=player,
+                    )
+                    last_song_key = song_key
+                    pending_song_key = None
+                    pending_song = None
+                    pending_count = 0
 
         elapsed = time.monotonic() - loop_started_at
         wait_seconds = max(0.0, args.interval - elapsed)
@@ -206,26 +241,53 @@ async def record_and_recognize(args: argparse.Namespace, audio_path: Path) -> Re
         )
 
     print("Recognizing music...")
-    return await recognize_music(audio_path)
+    return await recognize_music(
+        audio_path,
+        language=args.language,
+        segment_duration_seconds=max(5, int(args.seconds)),
+    )
+
+
+def switch_to_song(
+    song: RecognizedSong,
+    *,
+    searches_by_song: dict[str, YoutubeSearch],
+    player: YoutubePlayerServer | None,
+) -> YoutubeVideo:
+    song_key = song.key
+    search = searches_by_song.get(song_key)
+    if search is not None:
+        video = search.current
+        print(f"Detected change: {song.search_query}")
+        print(f"Top result: {video.title} ({search.position})")
+        print(video.url)
+        if player is not None:
+            player.show(search)
+        return video
+
+    search = open_youtube_for_song(song, player=player)
+    searches_by_song[song_key] = search
+    return search.current
 
 
 def open_youtube_for_song(
     song: RecognizedSong,
     *,
     player: YoutubePlayerServer | None,
-) -> YoutubeVideo:
+) -> YoutubeSearch:
     query = song.search_query
     print(f"Recognized: {query}")
 
     print("Searching YouTube...")
-    video = find_top_youtube_video(query)
-    print(f"Top result: {video.title}")
+    search = find_youtube_search(query)
+    video = search.current
+    print(f"Top result: {video.title} ({search.position})")
     print(video.url)
 
     if player is not None:
-        player.show(video)
+        player.show(search)
 
-    return video
+    return search
 
 
 def parse_sample_rate(value: str) -> int | None:

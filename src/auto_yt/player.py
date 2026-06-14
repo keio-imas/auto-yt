@@ -7,7 +7,11 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from auto_yt.youtube import YoutubeSearch
 from auto_yt.youtube import YoutubeVideo
+
+
+FALLBACK_AFTER_SECONDS = 8
 
 
 class YoutubePlayerServer:
@@ -16,7 +20,7 @@ class YoutubePlayerServer:
         self._thread: threading.Thread | None = None
         self._opened = False
         self._lock = threading.Lock()
-        self._video: YoutubeVideo | None = None
+        self._search: YoutubeSearch | None = None
 
     @property
     def url(self) -> str:
@@ -25,10 +29,10 @@ class YoutubePlayerServer:
         host, port = self._server.server_address
         return f"http://{host}:{port}/"
 
-    def show(self, video: YoutubeVideo) -> None:
+    def show(self, search: YoutubeSearch) -> None:
         self._ensure_started()
         with self._lock:
-            self._video = video
+            self._search = search
         if not self._opened:
             self.open()
         else:
@@ -41,16 +45,34 @@ class YoutubePlayerServer:
             webbrowser.open(self.url)
             self._opened = True
 
-    def state(self) -> dict[str, str | None]:
+    def state(self) -> dict[str, str | int | None]:
         with self._lock:
-            video = self._video
-        if video is None:
-            return {"title": None, "url": None, "embed_url": None}
+            search = self._search
+            video = search.current if search is not None else None
+            position = search.position if search is not None else None
+        if search is None or video is None:
+            return {"title": None, "url": None, "embed_url": None, "position": None}
         return {
             "title": video.title,
             "url": video.url,
             "embed_url": video.embed_url,
+            "position": position,
         }
+
+    def fallback(self) -> dict[str, str | int | None]:
+        with self._lock:
+            search = self._search
+            video = search.advance() if search is not None else None
+            position = search.position if search is not None else None
+
+        if search is None:
+            return {"ok": 0, "reason": "no active search", **self.state()}
+        if video is None:
+            return {"ok": 0, "reason": "no more candidates", **self.state()}
+
+        print(f"Embed fallback: {video.title} ({position})")
+        print(video.url)
+        return {"ok": 1, "reason": None, **self.state()}
 
     def _ensure_started(self) -> None:
         if self._server is not None:
@@ -66,6 +88,9 @@ class YoutubePlayerServer:
                 if self.path == "/state":
                     self._send_json(player.state())
                     return
+                if self.path == "/fallback":
+                    self._send_json(player.fallback())
+                    return
                 self.send_error(404)
 
             def log_message(self, format: str, *args: Any) -> None:
@@ -79,7 +104,7 @@ class YoutubePlayerServer:
                 self.end_headers()
                 self.wfile.write(payload)
 
-            def _send_json(self, data: dict[str, str | None]) -> None:
+            def _send_json(self, data: dict[str, str | int | None]) -> None:
                 payload = json.dumps(data).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -145,30 +170,109 @@ class YoutubePlayerServer:
   <main id="stage"></main>
   <footer>
     <strong id="title">{initial_title}</strong>
+    <span id="position"></span>
     <a id="link" href="{initial_url}" target="_blank" rel="noreferrer">Open on YouTube</a>
   </footer>
+  <script src="https://www.youtube.com/iframe_api"></script>
   <script>
     let current = null;
-    const initial = {{ title: {json.dumps(initial["title"])}, url: {json.dumps(initial["url"])}, embed_url: {json.dumps(initial["embed_url"])} }};
+    let player = null;
+    let fallbackTimer = null;
+    let fallbackInFlight = false;
+    let youtubeApiReady = false;
+    const fallbackAfterMs = {FALLBACK_AFTER_SECONDS * 1000};
+    const initial = {{ title: {json.dumps(initial["title"])}, url: {json.dumps(initial["url"])}, embed_url: {json.dumps(initial["embed_url"])}, position: {json.dumps(initial["position"])} }};
+    function onYouTubeIframeAPIReady() {{
+      youtubeApiReady = true;
+      refresh();
+    }}
+    function clearFallbackTimer() {{
+      if (fallbackTimer) {{
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }}
+    }}
+    function armFallbackTimer() {{
+      clearFallbackTimer();
+      fallbackTimer = setTimeout(requestFallback, fallbackAfterMs);
+    }}
+    async function requestFallback() {{
+      if (fallbackInFlight) {{
+        return;
+      }}
+      fallbackInFlight = true;
+      try {{
+        const response = await fetch('/fallback', {{ cache: 'no-store' }});
+        const data = await response.json();
+        if (!data.ok) {{
+          console.warn('fallback failed:', data.reason);
+        }}
+        render(data);
+      }} catch (error) {{
+        console.error(error);
+      }} finally {{
+        fallbackInFlight = false;
+      }}
+    }}
+    function onPlayerStateChange(event) {{
+      if (event.data === YT.PlayerState.PLAYING || event.data === YT.PlayerState.BUFFERING) {{
+        clearFallbackTimer();
+      }}
+      if (event.data === YT.PlayerState.UNSTARTED || event.data === YT.PlayerState.CUED) {{
+        armFallbackTimer();
+      }}
+    }}
     function render(state) {{
       const stage = document.getElementById("stage");
       const title = document.getElementById("title");
       const link = document.getElementById("link");
+      const position = document.getElementById("position");
       title.textContent = state.title || "Waiting for song";
       link.href = state.url || "#";
+      position.textContent = state.position ? `Result ${{state.position}}` : "";
       if (!state.embed_url) {{
         stage.innerHTML = '<div class="empty">Waiting for recognized music...</div>';
         current = null;
+        clearFallbackTimer();
         return;
       }}
       if (state.embed_url !== current) {{
+        if (!youtubeApiReady || !window.YT || !YT.Player) {{
+          setTimeout(() => render(state), 250);
+          return;
+        }}
         current = state.embed_url;
+        clearFallbackTimer();
         stage.innerHTML = '';
-        const iframe = document.createElement('iframe');
-        iframe.src = state.embed_url;
-        iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
-        iframe.allowFullscreen = true;
-        stage.appendChild(iframe);
+        const container = document.createElement('div');
+        container.id = 'youtube-player';
+        container.style.width = '100%';
+        container.style.height = '100%';
+        stage.appendChild(container);
+        if (player && player.destroy) {{
+          player.destroy();
+          player = null;
+        }}
+        const videoId = new URL(state.embed_url).pathname.split('/').pop();
+        player = new YT.Player('youtube-player', {{
+          width: '100%',
+          height: '100%',
+          videoId,
+          playerVars: {{
+            autoplay: 1,
+            mute: 1,
+            playsinline: 1,
+          }},
+          events: {{
+            onReady: (event) => {{
+              event.target.mute();
+              event.target.playVideo();
+              armFallbackTimer();
+            }},
+            onStateChange: onPlayerStateChange,
+            onError: requestFallback,
+          }},
+        }});
       }}
     }}
     async function refresh() {{
